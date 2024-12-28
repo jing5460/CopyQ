@@ -6,6 +6,7 @@
 
 #include "x11info.h"
 
+#include "common/clipboarddataguard.h"
 #include "common/common.h"
 #include "common/mimetypes.h"
 #include "common/log.h"
@@ -22,6 +23,7 @@
 
 #include <QClipboard>
 #include <QMimeData>
+#include <QPointer>
 
 namespace {
 
@@ -41,14 +43,14 @@ bool isSelectionIncomplete()
         return false;
 
     // If mouse button or shift is pressed then assume that user is selecting text.
-    XEvent event{};
+    XButtonEvent event{};
     XQueryPointer(display, DefaultRootWindow(display),
-                  &event.xbutton.root, &event.xbutton.window,
-                  &event.xbutton.x_root, &event.xbutton.y_root,
-                  &event.xbutton.x, &event.xbutton.y,
-                  &event.xbutton.state);
+                  &event.root, &event.window,
+                  &event.x_root, &event.y_root,
+                  &event.x, &event.y,
+                  &event.state);
 
-    return event.xbutton.state & (Button1Mask | ShiftMask);
+    return event.state & (Button1Mask | ShiftMask);
 #else
     return true;
 #endif
@@ -148,14 +150,14 @@ void X11PlatformClipboard::setData(ClipboardMode mode, const QVariantMap &dataMa
         // WORKAROUND: Avoid getting X11 warning "QXcbClipboard: SelectionRequest too old".
         QCoreApplication::processEvents();
         DummyClipboard::setData(mode, dataMap);
-    } else {
+    } else if (qobject_cast<QApplication*>(qApp) == nullptr) {
+        // WORKAROUND: QClipboard::setMimeData() with a simple windowless
+        // QGuiAplication on Wayland does not work.
         const auto data = createMimeData(dataMap);
         const auto qmode = modeToQClipboardMode(mode);
         WaylandClipboard::instance()->setMimeData(data, qmode);
-
-        // This makes pasting the clipboard work in own widgets.
-        const auto data2 = createMimeData(dataMap);
-        QGuiApplication::clipboard()->setMimeData(data2, qmode);
+    } else {
+        DummyClipboard::setData(mode, dataMap);
     }
 }
 
@@ -172,6 +174,8 @@ void X11PlatformClipboard::onChanged(int mode)
     auto &clipboardData = mode == QClipboard::Clipboard ? m_clipboardData : m_selectionData;
     if (!clipboardData.enabled)
         return;
+
+    ++clipboardData.sequenceNumber;
 
     // Store the current window title right after the clipboard/selection changes.
     // This makes sure that the title points to the correct clipboard/selection
@@ -196,14 +200,8 @@ void X11PlatformClipboard::onChanged(int mode)
         }
     }
 
-    if (m_clipboardData.cloningData || m_selectionData.cloningData) {
-        if (clipboardData.cloningData && !clipboardData.abortCloning) {
-            COPYQ_LOG( QString("Aborting getting %1, the data changed again")
-                       .arg(mode == QClipboard::Clipboard ? "clipboard" : "selection") );
-            clipboardData.abortCloning = true;
-        }
+    if (m_clipboardData.cloningData || m_selectionData.cloningData)
         return;
-    }
 
     updateClipboardData(&clipboardData);
 
@@ -245,10 +243,10 @@ void X11PlatformClipboard::updateClipboardData(X11PlatformClipboard::ClipboardDa
         return;
     }
 
-    const auto data = mimeData(clipboardData->mode);
+    ClipboardDataGuard data( mimeData(clipboardData->mode), &clipboardData->sequenceNumber );
 
     // Retry to retrieve clipboard data few times.
-    if (!data) {
+    if (data.isExpired()) {
         if ( !X11Info::isPlatformX11() )
             return;
 
@@ -269,12 +267,7 @@ void X11PlatformClipboard::updateClipboardData(X11PlatformClipboard::ClipboardDa
     }
     clipboardData->retry = 0;
 
-    // Ignore clipboard with secrets
-    const QByteArray passwordManagerHint = data->data(QStringLiteral("x-kde-passwordManagerHint"));
-    if ( passwordManagerHint == QByteArrayLiteral("secret") )
-        return;
-
-    const QByteArray newDataTimestampData = data->data(QStringLiteral("TIMESTAMP"));
+    const QByteArray newDataTimestampData = data.data(QStringLiteral("TIMESTAMP"));
     quint32 newDataTimestamp = 0;
     if ( !newDataTimestampData.isEmpty() ) {
         QDataStream stream(newDataTimestampData);
@@ -287,17 +280,20 @@ void X11PlatformClipboard::updateClipboardData(X11PlatformClipboard::ClipboardDa
     // In case there is a valid timestamp, omit update if the timestamp and
     // text did not change.
     if ( newDataTimestamp != 0 && clipboardData->newDataTimestamp == newDataTimestamp ) {
-        const QVariantMap newData = cloneData(*data, {mimeText});
-        if (newData.value(mimeText) == clipboardData->newData.value(mimeText))
+        const QVariantMap newData = cloneData(data, {mimeText});
+        if (data.isExpired() || newData.value(mimeText) == clipboardData->newData.value(mimeText))
             return;
     }
 
     clipboardData->timerEmitChange.stop();
-    clipboardData->abortCloning = false;
     clipboardData->cloningData = true;
-    clipboardData->newData = cloneData(*data, clipboardData->formats, &clipboardData->abortCloning);
+    const bool isDataSecret = isHidden(*data.mimeData());
+    clipboardData->newData = cloneData(data, clipboardData->formats);
+    if (isDataSecret)
+        clipboardData->newData[mimeSecret] = QByteArrayLiteral("1");
     clipboardData->cloningData = false;
-    if (clipboardData->abortCloning) {
+
+    if (data.isExpired()) {
         m_timerCheckAgain.setInterval(0);
         m_timerCheckAgain.start();
         return;

@@ -249,7 +249,9 @@ public:
 protected:
     void zwlr_data_control_offer_v1_offer(const QString &mime_type) override
     {
-        m_receivedFormats << mime_type;
+        if (!m_receivedFormats.contains(mime_type)) {
+            m_receivedFormats << mime_type;
+        }
     }
 
 #if QT_VERSION >= QT_VERSION_CHECK(6, 0, 0)
@@ -317,9 +319,12 @@ QVariant DataControlOffer::retrieveData(const QString &mimeType, QVariant::Type 
     wl_display_flush(display);
 
     ReceiveThread thread(pipeFds[0]);
+    QEventLoop loop;
+    connect(&thread, &QThread::finished, &loop, &QEventLoop::quit);
     thread.start();
-    while (thread.isRunning())
-        QCoreApplication::processEvents();
+    if (thread.isRunning())
+        loop.exec();
+
     const auto data = thread.data();
 
     if (!data.isEmpty() && mimeType == applicationQtXImageLiteral()) {
